@@ -512,6 +512,64 @@ pub fn with_retry_sync(
     }
 }
 
+/// Wrap a single-path filesystem operation (e.g., a removal) with retries on transient Windows
+/// operating-system errors.
+///
+/// On Windows, antivirus software, the search indexer, or other processes can hold a transient
+/// handle on a freshly written file, causing operations such as `remove_dir_all` to fail with
+/// `ERROR_ACCESS_DENIED` (`os error 5`). The common suggestion is to retry the operation with some
+/// backoff.
+///
+/// See: <https://github.com/astral-sh/uv/issues/15968> & <https://github.com/astral-sh/uv/issues/17430>
+#[cfg_attr(not(windows), expect(unused_variables))]
+fn remove_with_retry(
+    path: &Path,
+    operation: impl Fn() -> Result<(), std::io::Error>,
+) -> Result<(), std::io::Error> {
+    #[cfg(windows)]
+    {
+        use backon::BlockingRetryable;
+
+        operation
+            .retry(backoff_file_move())
+            .sleep(std::thread::sleep)
+            .when(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+            .notify(|err, _dur| {
+                warn!(
+                    "Retrying removal of {} due to transient error: {}",
+                    path.display(),
+                    err
+                );
+            })
+            .call()
+    }
+    #[cfg(not(windows))]
+    {
+        operation()
+    }
+}
+
+/// Like [`fs_err::remove_file`], but retries (on Windows) on transient operating-system errors such
+/// as antivirus or indexer file locks.
+pub fn remove_file_with_retry(path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+    let path = path.as_ref();
+    remove_with_retry(path, || fs_err::remove_file(path))
+}
+
+/// Like [`fs_err::remove_dir`], but retries (on Windows) on transient operating-system errors such
+/// as antivirus or indexer file locks.
+pub fn remove_dir_with_retry(path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+    let path = path.as_ref();
+    remove_with_retry(path, || fs_err::remove_dir(path))
+}
+
+/// Like [`fs_err::remove_dir_all`], but retries (on Windows) on transient operating-system errors
+/// such as antivirus or indexer file locks.
+pub fn remove_dir_all_with_retry(path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+    let path = path.as_ref();
+    remove_with_retry(path, || fs_err::remove_dir_all(path))
+}
+
 /// Why a file persist failed
 #[cfg(windows)]
 enum PersistRetryError {
@@ -979,6 +1037,39 @@ mod tests {
 
         assert!(!clear_virtualenv(&environment)?);
         assert!(environment.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_dir_all_with_retry_removes_populated_tree() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let dir = tempdir.path().join("pkg.data");
+        fs_err::create_dir(&dir)?;
+        fs_err::write(dir.join("file"), "content")?;
+        fs_err::create_dir(dir.join("nested"))?;
+        fs_err::write(dir.join("nested").join("file"), "content")?;
+
+        remove_dir_all_with_retry(&dir)?;
+
+        assert!(matches!(
+            fs_err::symlink_metadata(&dir),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_file_with_retry_removes_file() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let file = tempdir.path().join("file");
+        fs_err::write(&file, "content")?;
+
+        remove_file_with_retry(&file)?;
+
+        assert!(matches!(
+            fs_err::symlink_metadata(&file),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        ));
         Ok(())
     }
 }

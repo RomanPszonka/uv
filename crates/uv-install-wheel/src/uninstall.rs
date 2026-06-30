@@ -77,7 +77,7 @@ pub fn uninstall_wheel(
             }
         }
 
-        match fs_err::remove_file(&path) {
+        match uv_fs::remove_file_with_retry(&path) {
             Ok(()) => {
                 trace!("Removed file: {}", path.display());
                 file_count += 1;
@@ -86,7 +86,7 @@ pub fn uninstall_wheel(
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => match fs_err::remove_dir_all(&path) {
+            Err(err) => match uv_fs::remove_dir_all_with_retry(&path) {
                 Ok(()) => {
                     trace!("Removed directory: {}", path.display());
                     dir_count += 1;
@@ -119,7 +119,7 @@ pub fn uninstall_wheel(
             // may or may not be listed in the RECORD, but installers are expected to be smart
             // enough to remove it either way.
             let pycache = path.join("__pycache__");
-            match fs_err::remove_dir_all(&pycache) {
+            match uv_fs::remove_dir_all_with_retry(&pycache) {
                 Ok(()) => {
                     trace!("Removed directory: {}", pycache.display());
                     dir_count += 1;
@@ -141,7 +141,7 @@ pub fn uninstall_wheel(
                 break;
             }
 
-            fs_err::remove_dir(path)?;
+            uv_fs::remove_dir_with_retry(path)?;
 
             trace!("Removed directory: {}", path.display());
             dir_count += 1;
