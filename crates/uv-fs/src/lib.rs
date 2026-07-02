@@ -6,7 +6,7 @@ use std::io::Read;
 
 #[cfg(feature = "tokio")]
 use encoding_rs_io::DecodeReaderBytes;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 use tracing::{debug, warn};
 
 pub use crate::locked_file::*;
@@ -422,329 +422,249 @@ fn backoff_file_move() -> backon::ExponentialBackoff {
         .build()
 }
 
+/// Whether an I/O error may resolve on its own if the operation is retried.
+///
+/// On Windows, antivirus software, the search indexer, or other processes can hold a transient
+/// handle on a freshly written file, making operations such as renames, removals, or persists fail
+/// with `ERROR_ACCESS_DENIED` (surfaced as [`std::io::ErrorKind::PermissionDenied`]),
+/// `ERROR_SHARING_VIOLATION`, or `ERROR_LOCK_VIOLATION`.
+///
+/// The latter two have no dedicated [`std::io::ErrorKind`] and are only matched for errors that
+/// carry a raw OS error, such as those returned by [`TempPath::persist`]. `fs_err`-wrapped errors
+/// preserve the [`std::io::ErrorKind`] but erase the raw OS error, so for them only the
+/// `ERROR_ACCESS_DENIED` arm can match.
+#[cfg(windows)]
+fn is_transient_fs_error(err: &std::io::Error) -> bool {
+    use windows::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+
+    err.kind() == std::io::ErrorKind::PermissionDenied
+        || err.raw_os_error() == Some(ERROR_SHARING_VIOLATION.0.cast_signed())
+        || err.raw_os_error() == Some(ERROR_LOCK_VIOLATION.0.cast_signed())
+}
+
+/// Run a filesystem `operation`, retrying (on Windows) if it fails with a transient operating
+/// system error.
+///
+/// Transient errors (see `is_transient_fs_error`) are most common for DLLs, and the common
+/// suggestion is to retry the operation with some backoff, here `backoff_file_move`. Each retry
+/// is logged with the operation description returned by `describe`, which is only invoked when a
+/// retry occurs. On non-Windows platforms, the operation is run exactly once.
+///
+/// The final error is returned unchanged, so callers can still match on [`std::io::Error::kind`].
+///
+/// See: <https://github.com/astral-sh/uv/issues/1491>, <https://github.com/astral-sh/uv/issues/9531>,
+/// <https://github.com/astral-sh/uv/issues/15968> & <https://github.com/astral-sh/uv/issues/17430>
+#[cfg_attr(not(windows), expect(unused_variables))]
+fn retry_transient_sync<T>(
+    describe: impl Fn() -> String,
+    operation: impl FnMut() -> Result<T, std::io::Error>,
+) -> Result<T, std::io::Error> {
+    #[cfg(windows)]
+    {
+        use backon::BlockingRetryable;
+
+        operation
+            .retry(backoff_file_move())
+            .sleep(std::thread::sleep)
+            .when(is_transient_fs_error)
+            .notify(|err, _dur| {
+                warn!("Retrying {} due to transient error: {}", describe(), err);
+            })
+            .call()
+    }
+    #[cfg(not(windows))]
+    {
+        let mut operation = operation;
+        operation()
+    }
+}
+
+/// Asynchronous counterpart to [`retry_transient_sync`].
+#[cfg(feature = "tokio")]
+#[cfg_attr(not(windows), expect(unused_variables))]
+async fn retry_transient<T, Fut>(
+    describe: impl Fn() -> String,
+    operation: impl FnMut() -> Fut,
+) -> Result<T, std::io::Error>
+where
+    Fut: std::future::Future<Output = Result<T, std::io::Error>>,
+{
+    #[cfg(windows)]
+    {
+        use backon::Retryable;
+
+        operation
+            .retry(backoff_file_move())
+            .sleep(tokio::time::sleep)
+            .when(is_transient_fs_error)
+            .notify(|err, _dur| {
+                warn!("Retrying {} due to transient error: {}", describe(), err);
+            })
+            .await
+    }
+    #[cfg(not(windows))]
+    {
+        let mut operation = operation;
+        operation().await
+    }
+}
+
 /// Rename a file, retrying (on Windows) if it fails due to transient operating system errors.
 #[cfg(feature = "tokio")]
 pub async fn rename_with_retry(
     from: impl AsRef<Path>,
     to: impl AsRef<Path>,
 ) -> Result<(), std::io::Error> {
-    #[cfg(windows)]
-    {
-        use backon::Retryable;
-        // On Windows, antivirus software can lock files temporarily, making them inaccessible.
-        // This is most common for DLLs, and the common suggestion is to retry the operation with
-        // some backoff.
-        //
-        // See: <https://github.com/astral-sh/uv/issues/1491> & <https://github.com/astral-sh/uv/issues/9531>
-        let from = from.as_ref();
-        let to = to.as_ref();
+    let from = from.as_ref();
+    let to = to.as_ref();
 
-        let rename = async || fs_err::rename(from, to);
-
-        rename
-            .retry(backoff_file_move())
-            .sleep(tokio::time::sleep)
-            .when(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
-            .notify(|err, _dur| {
-                warn!(
-                    "Retrying rename from {} to {} due to transient error: {}",
-                    from.display(),
-                    to.display(),
-                    err
-                );
-            })
-            .await
-    }
-    #[cfg(not(windows))]
-    {
-        fs_err::tokio::rename(from, to).await
-    }
+    retry_transient(
+        || format!("rename from {} to {}", from.display(), to.display()),
+        || fs_err::tokio::rename(from, to),
+    )
+    .await
 }
 
-// TODO(zanieb): Look into reusing this code?
-/// Wrap an arbitrary operation on two files, e.g., copying, with retries on transient operating
-/// system errors.
-#[cfg_attr(not(windows), allow(unused_variables))]
+/// Wrap an arbitrary operation on two files, e.g., copying, with retries (on Windows) on
+/// transient operating system errors.
+///
+/// Unlike the other retry helpers, the returned error is wrapped with `operation_name` and both
+/// paths for context, which discards the original [`std::io::ErrorKind`].
 pub fn with_retry_sync(
     from: impl AsRef<Path>,
     to: impl AsRef<Path>,
     operation_name: &str,
     operation: impl Fn() -> Result<(), std::io::Error>,
 ) -> Result<(), std::io::Error> {
-    #[cfg(windows)]
-    {
-        use backon::BlockingRetryable;
-        // On Windows, antivirus software can lock files temporarily, making them inaccessible.
-        // This is most common for DLLs, and the common suggestion is to retry the operation with
-        // some backoff.
-        //
-        // See: <https://github.com/astral-sh/uv/issues/1491> & <https://github.com/astral-sh/uv/issues/9531>
-        let from = from.as_ref();
-        let to = to.as_ref();
+    let from = from.as_ref();
+    let to = to.as_ref();
 
-        operation
-            .retry(backoff_file_move())
-            .sleep(std::thread::sleep)
-            .when(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
-            .notify(|err, _dur| {
-                warn!(
-                    "Retrying {} from {} to {} due to transient error: {}",
-                    operation_name,
-                    from.display(),
-                    to.display(),
-                    err
-                );
-            })
-            .call()
-            .map_err(|err| {
-                std::io::Error::other(format!(
-                    "Failed {} {} to {}: {}",
-                    operation_name,
-                    from.display(),
-                    to.display(),
-                    err
-                ))
-            })
-    }
-    #[cfg(not(windows))]
-    {
-        operation()
-    }
-}
-
-/// Wrap a single-path filesystem operation (e.g., a removal) with retries on transient Windows
-/// operating-system errors.
-///
-/// On Windows, antivirus software, the search indexer, or other processes can hold a transient
-/// handle on a freshly written file, causing operations such as `remove_dir_all` to fail with
-/// `ERROR_ACCESS_DENIED` (`os error 5`). The common suggestion is to retry the operation with some
-/// backoff.
-///
-/// See: <https://github.com/astral-sh/uv/issues/15968> & <https://github.com/astral-sh/uv/issues/17430>
-#[cfg_attr(not(windows), expect(unused_variables))]
-fn remove_with_retry(
-    path: &Path,
-    operation: impl Fn() -> Result<(), std::io::Error>,
-) -> Result<(), std::io::Error> {
-    #[cfg(windows)]
-    {
-        use backon::BlockingRetryable;
-
-        operation
-            .retry(backoff_file_move())
-            .sleep(std::thread::sleep)
-            .when(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
-            .notify(|err, _dur| {
-                warn!(
-                    "Retrying removal of {} due to transient error: {}",
-                    path.display(),
-                    err
-                );
-            })
-            .call()
-    }
-    #[cfg(not(windows))]
-    {
-        operation()
-    }
+    retry_transient_sync(
+        || {
+            format!(
+                "{operation_name} from {} to {}",
+                from.display(),
+                to.display()
+            )
+        },
+        operation,
+    )
+    .map_err(|err| {
+        std::io::Error::other(format!(
+            "Failed {} {} to {}: {}",
+            operation_name,
+            from.display(),
+            to.display(),
+            err
+        ))
+    })
 }
 
 /// Like [`fs_err::remove_file`], but retries (on Windows) on transient operating-system errors such
 /// as antivirus or indexer file locks.
 pub fn remove_file_with_retry(path: impl AsRef<Path>) -> Result<(), std::io::Error> {
     let path = path.as_ref();
-    remove_with_retry(path, || fs_err::remove_file(path))
+    retry_transient_sync(
+        || format!("removal of {}", path.display()),
+        || fs_err::remove_file(path),
+    )
 }
 
 /// Like [`fs_err::remove_dir`], but retries (on Windows) on transient operating-system errors such
 /// as antivirus or indexer file locks.
 pub fn remove_dir_with_retry(path: impl AsRef<Path>) -> Result<(), std::io::Error> {
     let path = path.as_ref();
-    remove_with_retry(path, || fs_err::remove_dir(path))
+    retry_transient_sync(
+        || format!("removal of {}", path.display()),
+        || fs_err::remove_dir(path),
+    )
 }
 
 /// Like [`fs_err::remove_dir_all`], but retries (on Windows) on transient operating-system errors
 /// such as antivirus or indexer file locks.
 pub fn remove_dir_all_with_retry(path: impl AsRef<Path>) -> Result<(), std::io::Error> {
     let path = path.as_ref();
-    remove_with_retry(path, || fs_err::remove_dir_all(path))
+    retry_transient_sync(
+        || format!("removal of {}", path.display()),
+        || fs_err::remove_dir_all(path),
+    )
 }
 
-/// Why a file persist failed
-#[cfg(windows)]
-enum PersistRetryError {
-    /// Something went wrong while persisting, maybe retry (contains error message)
-    Persist(String),
-    /// Something went wrong trying to retrieve the file to persist, we must bail
-    LostState,
+/// Run a single persist attempt, giving the [`TempPath`] back to the caller through `temp_path`
+/// on failure so that the next attempt can reuse it.
+///
+/// [`TempPath::persist`] consumes the path and only returns it inside the error, so a retried
+/// closure cannot hold onto it directly; shuttling it through an [`Option`] keeps each attempt a
+/// plain [`FnMut`] call. Unlike a bare rename, [`TempPath::persist`] also clears the
+/// `FILE_ATTRIBUTE_TEMPORARY` flag on Windows and disarms the delete-on-drop guard on success.
+fn try_persist(temp_path: &mut Option<TempPath>, to: &Path) -> Result<(), std::io::Error> {
+    if let Some(path) = temp_path.take() {
+        path.persist(to).map_err(|err| {
+            // Put the temporary path back for the next attempt.
+            *temp_path = Some(err.path);
+            err.error
+        })
+    } else {
+        // Unreachable in practice: attempts run serially, and only a success (which ends the
+        // retry loop) leaves the option empty.
+        Err(std::io::Error::other(format!(
+            "Lost the temporary file while persisting to {}",
+            to.display()
+        )))
+    }
 }
 
-/// Persist a `NamedTempFile`, retrying (on Windows) if it fails due to transient operating system
-/// errors.
+/// Add the destination path to a persist error, preserving the [`std::io::ErrorKind`].
+fn persist_error_with_context(err: &std::io::Error, to: &Path) -> std::io::Error {
+    std::io::Error::new(
+        err.kind(),
+        format!(
+            "Failed to persist temporary file to {}: {}",
+            to.display(),
+            err
+        ),
+    )
+}
+
+/// Persist a [`NamedTempFile`], retrying (on Windows) if it fails due to transient operating
+/// system errors.
+///
+/// The file handle is closed before the first attempt, so it cannot contribute to sharing
+/// violations on Windows. If every attempt fails, the temporary file is deleted on drop.
 #[cfg(feature = "tokio")]
 async fn persist_with_retry(
     from: NamedTempFile,
     to: impl AsRef<Path>,
 ) -> Result<(), std::io::Error> {
-    #[cfg(windows)]
-    {
-        use backon::Retryable;
-        // On Windows, antivirus software can lock files temporarily, making them inaccessible.
-        // This is most common for DLLs, and the common suggestion is to retry the operation with
-        // some backoff.
-        //
-        // See: <https://github.com/astral-sh/uv/issues/1491> & <https://github.com/astral-sh/uv/issues/9531>
-        let to = to.as_ref();
+    let to = to.as_ref();
+    let mut temp_path = Some(from.into_temp_path());
 
-        // Ok there's a lot of complex ownership stuff going on here.
-        //
-        // the `NamedTempFile` `persist` method consumes `self`, and returns it back inside
-        // the Error in case of `PersistError`:
-        // https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist
-        // So every time we fail, we need to reset the `NamedTempFile` to try again.
-        //
-        // Every time we (re)try we call this outer closure (`let persist = ...`), so it needs to
-        // be at least a `FnMut` (as opposed to `Fnonce`). However the closure needs to return a
-        // totally owned `Future` (so effectively it returns a `FnOnce`).
-        //
-        // But if the `Future` is totally owned it *necessarily* can't write back the `NamedTempFile`
-        // to somewhere the outer `FnMut` can see using references. So we need to use `Arc`s
-        // with interior mutability (`Mutex`) to have the closure and all the Futures it creates share
-        // a single memory location that the `NamedTempFile` can be shuttled in and out of.
-        //
-        // In spite of the Mutex all of this code will run logically serially, so there shouldn't be a
-        // chance for a race where we try to get the `NamedTempFile` but it's actually None. The code
-        // is just written pedantically/robustly.
-        let from = std::sync::Arc::new(std::sync::Mutex::new(Some(from)));
-        let persist = || {
-            // Turn our by-ref-captured Arc into an owned Arc that the Future can capture by-value
-            let from2 = from.clone();
-
-            async move {
-                let maybe_file: Option<NamedTempFile> = from2
-                    .lock()
-                    .map_err(|_| PersistRetryError::LostState)?
-                    .take();
-                if let Some(file) = maybe_file {
-                    file.persist(to).map_err(|err| {
-                        let error_message: String = err.to_string();
-                        // Set back the `NamedTempFile` returned back by the Error
-                        if let Ok(mut guard) = from2.lock() {
-                            *guard = Some(err.file);
-                            PersistRetryError::Persist(error_message)
-                        } else {
-                            PersistRetryError::LostState
-                        }
-                    })
-                } else {
-                    Err(PersistRetryError::LostState)
-                }
-            }
-        };
-
-        let persisted = persist
-            .retry(backoff_file_move())
-            .sleep(tokio::time::sleep)
-            .when(|err| matches!(err, PersistRetryError::Persist(_)))
-            .notify(|err, _dur| {
-                if let PersistRetryError::Persist(error_message) = err {
-                    warn!(
-                        "Retrying to persist temporary file to {}: {}",
-                        to.display(),
-                        error_message,
-                    );
-                }
-            })
-            .await;
-
-        match persisted {
-            Ok(_) => Ok(()),
-            Err(PersistRetryError::Persist(error_message)) => Err(std::io::Error::other(format!(
-                "Failed to persist temporary file to {}: {}",
-                to.display(),
-                error_message,
-            ))),
-            Err(PersistRetryError::LostState) => Err(std::io::Error::other(format!(
-                "Failed to retrieve temporary file while trying to persist to {}",
-                to.display()
-            ))),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        async { fs_err::rename(from, to) }.await
-    }
+    // Persisting is synchronous, so each attempt runs eagerly when the operation closure is
+    // called and only the backoff sleeps are asynchronous.
+    retry_transient(
+        || format!("persist of temporary file to {}", to.display()),
+        || std::future::ready(try_persist(&mut temp_path, to)),
+    )
+    .await
+    .map_err(|err| persist_error_with_context(&err, to))
 }
 
-/// Persist a `NamedTempFile`, retrying (on Windows) if it fails due to transient operating system
-/// errors.
+/// Persist a [`NamedTempFile`], retrying (on Windows) if it fails due to transient operating
+/// system errors.
 ///
 /// This is a synchronous implementation of [`persist_with_retry`].
 pub fn persist_with_retry_sync(
     from: NamedTempFile,
     to: impl AsRef<Path>,
 ) -> Result<(), std::io::Error> {
-    #[cfg(windows)]
-    {
-        use backon::BlockingRetryable;
-        // On Windows, antivirus software can lock files temporarily, making them inaccessible.
-        // This is most common for DLLs, and the common suggestion is to retry the operation with
-        // some backoff.
-        //
-        // See: <https://github.com/astral-sh/uv/issues/1491> & <https://github.com/astral-sh/uv/issues/9531>
-        let to = to.as_ref();
+    let to = to.as_ref();
+    let mut temp_path = Some(from.into_temp_path());
 
-        // the `NamedTempFile` `persist` method consumes `self`, and returns it back inside the Error in case of `PersistError`
-        // https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist
-        // So we will update the `from` optional value in safe and borrow-checker friendly way every retry
-        // Allows us to use the NamedTempFile inside a FnMut closure used for backoff::retry
-        let mut from = Some(from);
-        let persist = || {
-            // Needed because we cannot move out of `from`, a captured variable in an `FnMut` closure, and then pass it to the async move block
-            if let Some(file) = from.take() {
-                file.persist(to).map_err(|err| {
-                    let error_message = err.to_string();
-                    // Set back the NamedTempFile returned back by the Error
-                    from = Some(err.file);
-                    PersistRetryError::Persist(error_message)
-                })
-            } else {
-                Err(PersistRetryError::LostState)
-            }
-        };
-
-        let persisted = persist
-            .retry(backoff_file_move())
-            .sleep(std::thread::sleep)
-            .when(|err| matches!(err, PersistRetryError::Persist(_)))
-            .notify(|err, _dur| {
-                if let PersistRetryError::Persist(error_message) = err {
-                    warn!(
-                        "Retrying to persist temporary file to {}: {}",
-                        to.display(),
-                        error_message,
-                    );
-                }
-            })
-            .call();
-
-        match persisted {
-            Ok(_) => Ok(()),
-            Err(PersistRetryError::Persist(error_message)) => Err(std::io::Error::other(format!(
-                "Failed to persist temporary file to {}: {}",
-                to.display(),
-                error_message,
-            ))),
-            Err(PersistRetryError::LostState) => Err(std::io::Error::other(format!(
-                "Failed to retrieve temporary file while trying to persist to {}",
-                to.display()
-            ))),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        fs_err::rename(from, to)
-    }
+    retry_transient_sync(
+        || format!("persist of temporary file to {}", to.display()),
+        || try_persist(&mut temp_path, to),
+    )
+    .map_err(|err| persist_error_with_context(&err, to))
 }
 
 /// Iterate over the subdirectories of a directory.
@@ -989,6 +909,8 @@ pub fn clear_virtualenv(location: &Path) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -1070,6 +992,432 @@ mod tests {
             fs_err::symlink_metadata(&file),
             Err(err) if err.kind() == io::ErrorKind::NotFound
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_file_with_retry_preserves_not_found_errors() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+
+        assert!(matches!(
+            remove_file_with_retry(tempdir.path().join("missing")),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    /// `uninstall_wheel` skips missing `__pycache__` directories by matching
+    /// [`io::ErrorKind::NotFound`]; the retry wrapper must not wrap the error.
+    #[test]
+    fn remove_dir_all_with_retry_preserves_not_found_errors() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+
+        assert!(matches!(
+            remove_dir_all_with_retry(tempdir.path().join("missing")),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_dir_with_retry_removes_empty_directory() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let directory = tempdir.path().join("directory");
+        fs_err::create_dir(&directory)?;
+
+        remove_dir_with_retry(&directory)?;
+
+        assert!(matches!(
+            fs_err::symlink_metadata(&directory),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn retry_transient_sync_returns_first_success() -> io::Result<()> {
+        let attempts = Cell::new(0_u32);
+
+        let value = retry_transient_sync(
+            || String::from("test operation"),
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok(42)
+            },
+        )?;
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn retry_transient_sync_does_not_retry_non_transient_errors() {
+        let attempts = Cell::new(0_u32);
+
+        let result: Result<(), _> = retry_transient_sync(
+            || String::from("test operation"),
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            },
+        );
+
+        assert_eq!(attempts.get(), 1);
+        assert!(matches!(result, Err(err) if err.kind() == io::ErrorKind::NotFound));
+    }
+
+    /// The retry loop only exists on Windows; other platforms run the operation exactly once,
+    /// even for errors that would be considered transient on Windows.
+    #[cfg(not(windows))]
+    #[test]
+    fn retry_transient_sync_does_not_retry_off_windows() {
+        let attempts = Cell::new(0_u32);
+
+        let result: Result<(), _> = retry_transient_sync(
+            || String::from("test operation"),
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            },
+        );
+
+        assert_eq!(attempts.get(), 1);
+        assert!(matches!(result, Err(err) if err.kind() == io::ErrorKind::PermissionDenied));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retry_transient_sync_retries_transient_errors_until_success() -> io::Result<()> {
+        let attempts = Cell::new(0_u32);
+
+        retry_transient_sync(
+            || String::from("test operation"),
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(())
+                }
+            },
+        )?;
+
+        assert_eq!(attempts.get(), 3);
+        Ok(())
+    }
+
+    /// Sharing violations have no dedicated [`io::ErrorKind`] and are retried based on the raw
+    /// OS error, which is only carried by bare operating system errors such as those returned by
+    /// [`TempPath::persist`].
+    #[cfg(windows)]
+    #[test]
+    fn retry_transient_sync_retries_sharing_violations_until_success() -> io::Result<()> {
+        use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        let attempts = Cell::new(0_u32);
+
+        retry_transient_sync(
+            || String::from("test operation"),
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    Err(io::Error::from_raw_os_error(
+                        ERROR_SHARING_VIOLATION.0.cast_signed(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )?;
+
+        assert_eq!(attempts.get(), 3);
+        Ok(())
+    }
+
+    /// [`fs_err`] wraps operating system errors as `io::Error::new(source.kind(), ..)`, which
+    /// preserves the [`io::ErrorKind`] but erases the raw OS error. The predicate therefore
+    /// matches wrapped access-denied errors by kind, while wrapped sharing violations (which have
+    /// no dedicated kind) are known not to match.
+    #[cfg(windows)]
+    #[test]
+    fn is_transient_fs_error_matches_bare_and_kind_preserving_errors() {
+        use windows::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+        };
+
+        // Bare OS errors carry the raw OS error, e.g., from `TempPath::persist`.
+        for code in [
+            ERROR_ACCESS_DENIED.0.cast_signed(),
+            ERROR_SHARING_VIOLATION.0.cast_signed(),
+            ERROR_LOCK_VIOLATION.0.cast_signed(),
+        ] {
+            assert!(is_transient_fs_error(&io::Error::from_raw_os_error(code)));
+        }
+        assert!(!is_transient_fs_error(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+
+        // `fs_err`-style wrapping: the kind survives, the raw OS error does not.
+        let wrap = |code: i32| {
+            let inner = io::Error::from_raw_os_error(code);
+            io::Error::new(inner.kind(), inner)
+        };
+        assert!(is_transient_fs_error(&wrap(
+            ERROR_ACCESS_DENIED.0.cast_signed()
+        )));
+        assert!(!is_transient_fs_error(&wrap(
+            ERROR_SHARING_VIOLATION.0.cast_signed()
+        )));
+    }
+
+    #[test]
+    fn with_retry_sync_returns_success() -> io::Result<()> {
+        with_retry_sync("source.txt", "target.txt", "copying", || Ok(()))
+    }
+
+    /// The wrap adds context but collapses the [`io::ErrorKind`] to [`io::ErrorKind::Other`];
+    /// callers must not match on the kind.
+    #[test]
+    fn with_retry_sync_wraps_the_error_with_context() {
+        let result = with_retry_sync("source.txt", "target.txt", "copying", || {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        });
+
+        assert!(matches!(
+            result,
+            Err(err) if err.kind() == io::ErrorKind::Other
+                && err.to_string().starts_with("Failed copying source.txt to target.txt:")
+        ));
+    }
+
+    #[test]
+    fn persist_with_retry_sync_moves_the_temporary_file() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let target = tempdir.path().join("target");
+
+        let temp_file = tempfile_in(tempdir.path())?;
+        fs_err::write(&temp_file, "content")?;
+        let temp_file_path = temp_file.path().to_path_buf();
+
+        persist_with_retry_sync(temp_file, &target)?;
+
+        assert_eq!(fs_err::read_to_string(&target)?, "content");
+        assert!(matches!(
+            fs_err::symlink_metadata(&temp_file_path),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn persist_with_retry_sync_replaces_an_existing_file() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let target = tempdir.path().join("target");
+        fs_err::write(&target, "old")?;
+
+        let temp_file = tempfile_in(tempdir.path())?;
+        fs_err::write(&temp_file, "new")?;
+
+        persist_with_retry_sync(temp_file, &target)?;
+
+        assert_eq!(fs_err::read_to_string(&target)?, "new");
+        Ok(())
+    }
+
+    /// A failed persist deletes the temporary file, returns an error with context, and preserves
+    /// the underlying [`io::ErrorKind`].
+    #[test]
+    fn persist_with_retry_sync_cleans_up_on_failure() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let target = tempdir.path().join("nonexistent").join("target");
+
+        let temp_file = tempfile_in(tempdir.path())?;
+        let temp_file_path = temp_file.path().to_path_buf();
+
+        assert!(matches!(
+            persist_with_retry_sync(temp_file, &target),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+                && err.to_string().starts_with("Failed to persist temporary file to")
+        ));
+        assert!(matches!(
+            fs_err::symlink_metadata(&temp_file_path),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn write_atomic_sync_replaces_an_existing_file() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let target = tempdir.path().join("target");
+        fs_err::write(&target, "old")?;
+
+        write_atomic_sync(&target, "new")?;
+
+        assert_eq!(fs_err::read_to_string(&target)?, "new");
+        Ok(())
+    }
+
+    #[test]
+    fn copy_atomic_sync_copies_the_source_file() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let source = tempdir.path().join("source");
+        let target = tempdir.path().join("target");
+        fs_err::write(&source, "content")?;
+
+        copy_atomic_sync(&source, &target)?;
+
+        assert_eq!(fs_err::read_to_string(&target)?, "content");
+        assert_eq!(fs_err::read_to_string(&source)?, "content");
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn retry_transient_returns_first_success() -> io::Result<()> {
+        let attempts = Cell::new(0_u32);
+
+        let value = retry_transient(
+            || String::from("test operation"),
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Ok(42))
+            },
+        )
+        .await?;
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts.get(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn retry_transient_does_not_retry_non_transient_errors() {
+        let attempts = Cell::new(0_u32);
+
+        let result: Result<(), _> = retry_transient(
+            || String::from("test operation"),
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Err(io::Error::from(io::ErrorKind::NotFound)))
+            },
+        )
+        .await;
+
+        assert_eq!(attempts.get(), 1);
+        assert!(matches!(result, Err(err) if err.kind() == io::ErrorKind::NotFound));
+    }
+
+    #[cfg(all(windows, feature = "tokio"))]
+    #[tokio::test]
+    async fn retry_transient_retries_transient_errors_until_success() -> io::Result<()> {
+        let attempts = Cell::new(0_u32);
+
+        retry_transient(
+            || String::from("test operation"),
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(if attempts.get() < 3 {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(())
+                })
+            },
+        )
+        .await?;
+
+        assert_eq!(attempts.get(), 3);
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn rename_with_retry_renames_a_file() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let source = tempdir.path().join("source");
+        let target = tempdir.path().join("target");
+        fs_err::write(&source, "content")?;
+
+        rename_with_retry(&source, &target).await?;
+
+        assert_eq!(fs_err::read_to_string(&target)?, "content");
+        assert!(matches!(
+            fs_err::symlink_metadata(&source),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn rename_with_retry_preserves_not_found_errors() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+
+        let result = rename_with_retry(
+            tempdir.path().join("missing"),
+            tempdir.path().join("target"),
+        )
+        .await;
+
+        assert!(matches!(result, Err(err) if err.kind() == io::ErrorKind::NotFound));
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn persist_with_retry_replaces_an_existing_file() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let target = tempdir.path().join("target");
+        fs_err::write(&target, "old")?;
+
+        let temp_file = tempfile_in(tempdir.path())?;
+        fs_err::write(&temp_file, "new")?;
+        let temp_file_path = temp_file.path().to_path_buf();
+
+        persist_with_retry(temp_file, &target).await?;
+
+        assert_eq!(fs_err::read_to_string(&target)?, "new");
+        assert!(matches!(
+            fs_err::symlink_metadata(&temp_file_path),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    /// Async counterpart to [`persist_with_retry_sync_cleans_up_on_failure`].
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn persist_with_retry_cleans_up_on_failure() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let target = tempdir.path().join("nonexistent").join("target");
+
+        let temp_file = tempfile_in(tempdir.path())?;
+        let temp_file_path = temp_file.path().to_path_buf();
+
+        assert!(matches!(
+            persist_with_retry(temp_file, &target).await,
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+                && err.to_string().starts_with("Failed to persist temporary file to")
+        ));
+        assert!(matches!(
+            fs_err::symlink_metadata(&temp_file_path),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn write_atomic_replaces_an_existing_file() -> io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let target = tempdir.path().join("target");
+        fs_err::write(&target, "old")?;
+
+        write_atomic(&target, "new").await?;
+
+        assert_eq!(fs_err::read_to_string(&target)?, "new");
         Ok(())
     }
 }
